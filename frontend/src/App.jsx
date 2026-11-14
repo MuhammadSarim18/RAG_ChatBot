@@ -2,7 +2,7 @@ import { useState, useRef, useEffect } from "react";
 import "./App.css";
 
 
-const API_BASE = "https://rag-chatbot-j9xl.onrender.com";
+const API_BASE = "https://rag-chatbot-4a0s.onrender.com";
 
 export default function App() {
   const [messages, setMessages] = useState([]);
