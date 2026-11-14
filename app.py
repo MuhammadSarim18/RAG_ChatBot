@@ -1,72 +1,120 @@
 import os
 import sys
 from contextlib import asynccontextmanager
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
+import numpy as np
+import requests
 import psycopg2
 from psycopg2 import pool
 from pgvector.psycopg2 import register_vector
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from sentence_transformers import SentenceTransformer
 from groq import Groq, APIError
 
 # Configuration
 DB_URL = os.environ.get("DATABASE_URL", "postgresql://rag:rag@localhost:5432/rag_kb")
 MODEL_NAME = "all-mpnet-base-v2"
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
 SIMILARITY_THRESHOLD = 0.3
 TOP_K = 5
 
-app_state: Dict[str, Any] = {}
+app_state: Dict[str, Any] = {
+    "db_pool": None,
+    "model": None,
+    "groq_client": None
+}
+
+
+def get_db_pool() -> pool.ThreadedConnectionPool:
+    """Lazy-initializes the PostgreSQL connection pool."""
+    if app_state["db_pool"] is None:
+        print(f"Connecting to Postgres at {DB_URL}...")
+        try:
+            # Set connect_timeout so it never hangs indefinitely
+            db_pool = pool.ThreadedConnectionPool(
+                minconn=1,
+                maxconn=5,
+                dsn=DB_URL,
+                connect_timeout=10
+            )
+            test_conn = db_pool.getconn()
+            register_vector(test_conn)
+            db_pool.putconn(test_conn)
+            app_state["db_pool"] = db_pool
+            print("Database connection pool initialized.")
+        except Exception as e:
+            print(f"Failed to connect to database: {e}", file=sys.stderr)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Database connection error: {str(e)}"
+            )
+    return app_state["db_pool"]
+
+
+def get_embedding(text: str) -> np.ndarray:
+    """
+    Computes 768-dim embedding for text.
+    Uses Hugging Face Serverless API if HF_TOKEN is provided (recommended on Render free tier to use 0 MB RAM),
+    otherwise falls back to local SentenceTransformer.
+    """
+    hf_token = os.environ.get("HF_TOKEN")
+    if hf_token:
+        try:
+            api_url = f"https://router.huggingface.co/hf-inference/models/sentence-transformers/{MODEL_NAME}"
+            headers = {"Authorization": f"Bearer {hf_token}"}
+            resp = requests.post(api_url, headers=headers, json={"inputs": text}, timeout=20)
+            if resp.status_code == 200:
+                data = resp.json()
+                # Handle pipeline response format
+                if isinstance(data, list):
+                    if len(data) > 0 and isinstance(data[0], list):
+                        data = data[0]
+                    return np.array(data, dtype=np.float32)
+            else:
+                print(f"HF API returned {resp.status_code}: {resp.text}, falling back to local model.")
+        except Exception as e:
+            print(f"HF API call failed ({e}), falling back to local model.")
+
+    # Local fallback
+    if app_state["model"] is None:
+        print(f"Loading local SentenceTransformer model '{MODEL_NAME}'...")
+        from sentence_transformers import SentenceTransformer
+        app_state["model"] = SentenceTransformer(MODEL_NAME)
+        print("Local model loaded.")
+
+    return app_state["model"].encode(text, convert_to_numpy=True)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initializes embedding model and database pool on startup."""
-    print("Initializing application resources...")
-    
-    # 1. Load SentenceTransformer model once on startup
-    print(f"Loading embedding model '{MODEL_NAME}'...")
-    embedding_model = SentenceTransformer(MODEL_NAME)
-    app_state["model"] = embedding_model
-    print("Embedding model loaded successfully.")
+    """
+    Non-blocking lifespan manager.
+    Allows uvicorn to bind the port immediately so Render detects the service as live instantly.
+    """
+    print("Application starting up... Port will open immediately.")
 
-    # 2. Initialize Postgres Connection Pool
-    print(f"Connecting to Postgres at {DB_URL}...")
-    try:
-        db_pool = pool.ThreadedConnectionPool(minconn=1, maxconn=10, dsn=DB_URL)
-        test_conn = db_pool.getconn()
-        register_vector(test_conn)
-        db_pool.putconn(test_conn)
-        app_state["db_pool"] = db_pool
-        print("Database connection pool initialized.")
-    except Exception as e:
-        print(f"Failed to connect to database: {e}", file=sys.stderr)
-        raise
-
-    # 3. Initialize Groq Client
+    # Initialize Groq client
     groq_api_key = os.environ.get("GROQ_API_KEY")
     if groq_api_key:
         app_state["groq_client"] = Groq(api_key=groq_api_key)
         print("Groq client initialized.")
     else:
-        print("WARNING: GROQ_API_KEY environment variable is not set. Set it before sending chat queries.")
-        app_state["groq_client"] = None
+        print("WARNING: GROQ_API_KEY environment variable is not set.")
 
     yield
 
     # Cleanup resources on shutdown
     print("Shutting down resources...")
-    if "db_pool" in app_state:
+    if app_state["db_pool"]:
         app_state["db_pool"].closeall()
         print("Database connection pool closed.")
 
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="RAG Chatbot Backend (Groq)",
+    title="RAG Chatbot Backend",
     description="FastAPI backend with pgvector cosine similarity retrieval and Groq LLM generation",
     version="1.0.0",
     lifespan=lifespan
@@ -86,9 +134,14 @@ def root():
     return {
         "status": "online",
         "message": "RAG Chatbot API is running!",
-        "interactive_docs": "http://localhost:8000/docs",
+        "interactive_docs": "/docs",
         "endpoint": "POST /api/chat"
     }
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
 
 
 # Request & Response schemas
@@ -111,10 +164,8 @@ def query_nearest_chunks(query_text: str, top_k: int = TOP_K) -> List[Dict[str, 
     Embeds query text and retrieves top_k nearest chunks using pgvector's <=> operator.
     Calculates similarity as (1 - distance).
     """
-    model: SentenceTransformer = app_state["model"]
-    db_pool: pool.ThreadedConnectionPool = app_state["db_pool"]
-
-    query_vector = model.encode(query_text, convert_to_numpy=True)
+    query_vector = get_embedding(query_text)
+    db_pool = get_db_pool()
 
     conn = db_pool.getconn()
     try:
@@ -200,7 +251,7 @@ async def chat_endpoint(request: ChatRequest):
         if not api_key:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="GROQ_API_KEY environment variable is not set. Please set your GROQ_API_KEY."
+                detail="GROQ_API_KEY environment variable is not set. Please set your GROQ_API_KEY in Render settings."
             )
         client = Groq(api_key=api_key)
         app_state["groq_client"] = client
@@ -235,4 +286,5 @@ async def chat_endpoint(request: ChatRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True)
