@@ -15,7 +15,7 @@ from groq import Groq, APIError
 
 # Configuration
 DB_URL = os.environ.get("DATABASE_URL", "postgresql://rag:rag@localhost:5432/rag_kb")
-MODEL_NAME = "all-mpnet-base-v2"
+MODEL_NAME = "all-MiniLM-L6-v2"
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 SIMILARITY_THRESHOLD = 0.3
 TOP_K = 5
