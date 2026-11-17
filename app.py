@@ -1,10 +1,10 @@
 import os
 import sys
+import threading
 from contextlib import asynccontextmanager
 from typing import List, Dict, Any, Optional
 
 import numpy as np
-import requests
 import psycopg2
 from psycopg2 import pool
 from pgvector.psycopg2 import register_vector
@@ -15,7 +15,8 @@ from groq import Groq, APIError
 
 # Configuration
 DB_URL = os.environ.get("DATABASE_URL", "postgresql://rag:rag@localhost:5432/rag_kb")
-MODEL_NAME = "all-MiniLM-L6-v2"
+# fastembed uses the full Hugging Face model id (same model as before, so stored vectors stay valid)
+MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 SIMILARITY_THRESHOLD = 0.3
 TOP_K = 5
@@ -26,11 +27,15 @@ app_state: Dict[str, Any] = {
     "groq_client": None
 }
 
+# Prevents two simultaneous first requests from loading the model twice (double memory)
+_model_lock = threading.Lock()
+
 
 def get_db_pool() -> pool.ThreadedConnectionPool:
     """Lazy-initializes the PostgreSQL connection pool."""
     if app_state["db_pool"] is None:
-        print(f"Connecting to Postgres at {DB_URL}...")
+        # Never print the full URL: it contains the database password
+        print("Connecting to Postgres...")
         try:
             # Set connect_timeout so it never hangs indefinitely
             db_pool = pool.ThreadedConnectionPool(
@@ -55,36 +60,20 @@ def get_db_pool() -> pool.ThreadedConnectionPool:
 
 def get_embedding(text: str) -> np.ndarray:
     """
-    Computes 768-dim embedding for text.
-    Uses Hugging Face Serverless API if HF_TOKEN is provided (recommended on Render free tier to use 0 MB RAM),
-    otherwise falls back to local SentenceTransformer.
+    Computes a 384-dim embedding for text using all-MiniLM-L6-v2 via fastembed (ONNX).
+    No PyTorch is loaded, so it fits within Render's 512 MB free-tier limit.
+    The model is loaded once on the first request and then reused.
     """
-    hf_token = os.environ.get("HF_TOKEN")
-    if hf_token:
-        try:
-            api_url = f"https://router.huggingface.co/hf-inference/models/sentence-transformers/{MODEL_NAME}"
-            headers = {"Authorization": f"Bearer {hf_token}"}
-            resp = requests.post(api_url, headers=headers, json={"inputs": text}, timeout=20)
-            if resp.status_code == 200:
-                data = resp.json()
-                # Handle pipeline response format
-                if isinstance(data, list):
-                    if len(data) > 0 and isinstance(data[0], list):
-                        data = data[0]
-                    return np.array(data, dtype=np.float32)
-            else:
-                print(f"HF API returned {resp.status_code}: {resp.text}, falling back to local model.")
-        except Exception as e:
-            print(f"HF API call failed ({e}), falling back to local model.")
-
-    # Local fallback
     if app_state["model"] is None:
-        print(f"Loading local SentenceTransformer model '{MODEL_NAME}'...")
-        from sentence_transformers import SentenceTransformer
-        app_state["model"] = SentenceTransformer(MODEL_NAME)
-        print("Local model loaded.")
+        with _model_lock:
+            if app_state["model"] is None:
+                print(f"Loading embedding model '{MODEL_NAME}'...")
+                from fastembed import TextEmbedding
+                app_state["model"] = TextEmbedding(model_name=MODEL_NAME, threads=1)
+                print("Embedding model loaded.")
 
-    return app_state["model"].encode(text, convert_to_numpy=True)
+    vector = next(iter(app_state["model"].embed([text])))
+    return np.array(vector, dtype=np.float32)
 
 
 @asynccontextmanager
@@ -196,8 +185,10 @@ def query_nearest_chunks(query_text: str, top_k: int = TOP_K) -> List[Dict[str, 
         db_pool.putconn(conn)
 
 
+# Plain `def` (not `async def`): the embedding, DB and Groq calls below are blocking,
+# so FastAPI runs this in its thread pool instead of freezing the event loop.
 @app.post("/api/chat", response_model=ChatResponse)
-async def chat_endpoint(request: ChatRequest):
+def chat_endpoint(request: ChatRequest):
     user_query = request.text.strip()
     if not user_query:
         raise HTTPException(
@@ -287,4 +278,6 @@ async def chat_endpoint(request: ChatRequest):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True)
+    # reload=True spawns an extra watcher process (extra memory), so keep it off.
+    # For local development, run: uvicorn app:app --reload
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
