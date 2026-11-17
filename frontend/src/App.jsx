@@ -1,168 +1,254 @@
 import { useState, useRef, useEffect } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import "./App.css";
 
-
+// const API_BASE = "http://127.0.0.1:8000";
 const API_BASE = "https://rag-chatbot-4a0s.onrender.com";
+
+const SUGGESTIONS = [
+  "Suggest me study destinations",
+  "What are the visa requirements for the UK?",
+  "Which countries offer post-study work visas?",
+  "What are the cheapest countries to study in?",
+];
+
+// Removes citation artifacts like 【1†L1-L22】 that some models add
+function cleanAnswer(text) {
+  return (text || "")
+    .replace(/【[^】]*】/g, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .trim();
+}
+
+function Avatar({ role }) {
+  return (
+    <div className={`avatar ${role}`}>{role === "user" ? "You" : "TC"}</div>
+  );
+}
+
+function Message({ msg }) {
+  const isUser = msg.role === "user";
+  return (
+    <div className={`row ${isUser ? "row-user" : "row-bot"}`}>
+      {!isUser && <Avatar role="bot" />}
+      <div className="msg-col">
+        <div
+          className={`bubble ${isUser ? "bubble-user" : "bubble-bot"} ${
+            msg.isError ? "bubble-error" : ""
+          }`}
+        >
+          {isUser || msg.isError ? (
+            msg.text
+          ) : (
+            <ReactMarkdown
+              remarkPlugins={[remarkGfm]}
+              components={{
+                a: ({ node, ...props }) => (
+                  <a {...props} target="_blank" rel="noreferrer" />
+                ),
+                table: ({ node, ...props }) => (
+                  <div className="table-wrap">
+                    <table {...props} />
+                  </div>
+                ),
+              }}
+            >
+              {msg.text}
+            </ReactMarkdown>
+          )}
+        </div>
+
+        {!isUser && msg.sources && msg.sources.length > 0 && (
+          <details className="sources">
+            <summary>Sources ({msg.sources.length})</summary>
+            <ol>
+              {msg.sources.map((s, i) => (
+                <li key={i}>
+                  <a href={s.url} target="_blank" rel="noreferrer">
+                    {s.title || s.url}
+                  </a>
+                </li>
+              ))}
+            </ol>
+          </details>
+        )}
+      </div>
+      {isUser && <Avatar role="user" />}
+    </div>
+  );
+}
+
+function TypingIndicator() {
+  return (
+    <div className="row row-bot">
+      <Avatar role="bot" />
+      <div className="bubble bubble-bot typing">
+        <span />
+        <span />
+        <span />
+      </div>
+    </div>
+  );
+}
 
 export default function App() {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
-  const [errorMessage, setErrorMessage] = useState(null);
   const messagesEndRef = useRef(null);
+  const textareaRef = useRef(null);
 
   // Auto-scroll to the latest message
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, isLoading]);
 
-  const send = async () => {
-    const trimmed = input.trim();
+  // Auto-grow the input box (up to a limit)
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = Math.min(el.scrollHeight, 140) + "px";
+  }, [input]);
+
+  const send = async (override) => {
+    const trimmed = (override ?? input).trim();
     if (!trimmed || isLoading) return;
 
-    // 1. Append user's message immediately
-    const userMessage = { role: "user", text: trimmed };
-    setMessages((prev) => [...prev, userMessage]);
+    setMessages((prev) => [...prev, { role: "user", text: trimmed }]);
     setInput("");
     setIsLoading(true);
-    setErrorMessage(null);
+
+    // Render's free tier can take ~50s to wake up, so allow a long timeout
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 90000);
 
     try {
-      // 2. POST {"text": ...} to /api/chat
       const response = await fetch(`${API_BASE}/api/chat`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text: trimmed }),
+        signal: controller.signal,
       });
 
       if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(
-          errorData.detail || `Server error: ${response.status} ${response.statusText}`
-        );
+        let detail = `Server error (${response.status})`;
+        try {
+          const err = await response.json();
+          if (err.detail) {
+            detail =
+              typeof err.detail === "string"
+                ? err.detail
+                : JSON.stringify(err.detail);
+          }
+        } catch {
+          /* response was not JSON */
+        }
+        throw new Error(detail);
       }
 
       const data = await response.json();
-
-      // 3. Append assistant's reply and sources
-      const assistantMessage = {
-        role: "assistant",
-        text: data.answer || "No response received.",
-        sources: Array.isArray(data.sources) ? data.sources : [],
-      };
-
-      setMessages((prev) => [...prev, assistantMessage]);
-    } catch (err) {
-      console.error("Chat error:", err);
-      setErrorMessage(err.message || "Failed to connect to the chat server.");
       setMessages((prev) => [
         ...prev,
         {
           role: "assistant",
-          text: `Error: ${err.message || "An error occurred while fetching the response."}`,
-          isError: true,
-          sources: [],
+          text: cleanAnswer(data.answer),
+          sources: data.sources || [],
         },
       ]);
+    } catch (err) {
+      let text = err.message;
+      if (err.name === "AbortError") {
+        text =
+          "The server took too long to respond. It may be waking up, so please try again.";
+      } else if (err.message === "Failed to fetch") {
+        text =
+          "Couldn't reach the server. It may be waking up, so try again in a moment.";
+      }
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", text, isError: true },
+      ]);
     } finally {
+      clearTimeout(timer);
       setIsLoading(false);
     }
   };
 
-  const handleSubmit = (e) => {
-    e.preventDefault();
-    send();
+  const handleKeyDown = (e) => {
+    // Enter sends, Shift+Enter adds a new line
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      send();
+    }
   };
 
   return (
-    <div className="chat-app">
-      <header className="chat-header">
-        <div className="chat-header-title">
-          <h1>Times Consultant RAG Knowledge Base</h1>
-          <span className="badge">pgvector + LLM</span>
-        </div>
-      </header>
-
-      {/* Scrollable message list */}
-      <main className="messages-list">
-        {messages.length === 0 && (
-          <div className="empty-state">
-            <h2>Welcome to Times Consultant Assistant</h2>
-            <p>
-              Ask any question regarding study destinations, scholarships, visa
-              guidelines, application steps, or upcoming educational events.
-            </p>
-          </div>
-        )}
-
-        {messages.map((msg, index) => (
-          <div key={index} className={`message-item ${msg.role}`}>
-            <div className={`message-bubble ${msg.isError ? "error" : ""}`}>
-              {msg.text}
-            </div>
-
-            {/* Render sources array under each assistant message */}
-            {msg.role === "assistant" && msg.sources && msg.sources.length > 0 && (
-              <div className="message-sources">
-                <div className="sources-header">Sources & References:</div>
-                <ul className="sources-list">
-                  {msg.sources.map((src, srcIndex) => (
-                    <li key={srcIndex}>
-                      <a
-                        href={src.url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="source-link"
-                      >
-                        <span className="source-index">[{srcIndex + 1}]</span>{" "}
-                        {src.title || src.url}
-                      </a>
-                    </li>
-                  ))}
-                </ul>
+    <div className="page">
+      <div className="chat">
+        <header className="chat-header">
+          <div className="header-left">
+            <div className="logo">TC</div>
+            <div>
+              <div className="title">Times Consultant Assistant</div>
+              <div className="status">
+                <span className="dot" /> Online
               </div>
-            )}
-          </div>
-        ))}
-
-        {/* Loading indicator while waiting */}
-        {isLoading && (
-          <div className="loading-indicator">
-            <div className="dot-pulse">
-              <span></span>
-              <span></span>
-              <span></span>
             </div>
-            <span>Searching knowledge base and generating answer...</span>
           </div>
-        )}
+          {messages.length > 0 && (
+            <button
+              className="clear-btn"
+              onClick={() => setMessages([])}
+              disabled={isLoading}
+            >
+              New chat
+            </button>
+          )}
+        </header>
 
-        {errorMessage && <div className="error-banner">{errorMessage}</div>}
+        <main className="messages">
+          {messages.length === 0 && !isLoading ? (
+            <div className="welcome">
+              <div className="welcome-logo">TC</div>
+              <h2>How can I help you today?</h2>
+              <p>Ask about study visas, requirements, or programs abroad.</p>
+              <div className="chips">
+                {SUGGESTIONS.map((s) => (
+                  <button key={s} className="chip" onClick={() => send(s)}>
+                    {s}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : (
+            messages.map((m, i) => <Message key={i} msg={m} />)
+          )}
+          {isLoading && <TypingIndicator />}
+          <div ref={messagesEndRef} />
+        </main>
 
-        <div ref={messagesEndRef} />
-      </main>
-
-      {/* Input form */}
-      <form className="chat-input-form" onSubmit={handleSubmit}>
-        <input
-          type="text"
-          className="chat-input"
-          placeholder="Ask a question about study visas, requirements, or programs..."
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          disabled={isLoading}
-          autoFocus
-        />
-        <button
-          type="submit"
-          className="send-button"
-          disabled={isLoading || !input.trim()}
-        >
-          {isLoading ? "Thinking..." : "Send"}
-        </button>
-      </form>
+        <footer className="composer">
+          <textarea
+            ref={textareaRef}
+            rows={1}
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={handleKeyDown}
+            placeholder="Ask a question about study visas, requirements, or programs..."
+            disabled={isLoading}
+          />
+          <button
+            className="send-btn"
+            onClick={() => send()}
+            disabled={isLoading || !input.trim()}
+            aria-label="Send"
+          >
+            Send
+          </button>
+        </footer>
+      </div>
     </div>
   );
 }
